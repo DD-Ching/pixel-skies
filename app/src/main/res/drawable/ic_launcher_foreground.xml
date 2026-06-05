@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A simple original retro fighter jet, drawn as a vector so no PNG assets are needed. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Wings -->
+    <path
+        android:fillColor="#2FA9D6"
+        android:pathData="M24,60 L84,60 L72,70 L36,70 Z" />
+    <!-- Fuselage -->
+    <path
+        android:fillColor="#6FE3FF"
+        android:pathData="M50,30 L58,30 L60,76 L48,76 Z" />
+    <!-- Nose -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M52,26 L56,26 L58,34 L50,34 Z" />
+    <!-- Twin bullets -->
+    <path
+        android:fillColor="#FFF36B"
+        android:pathData="M46,16 h3 v8 h-3 Z M59,16 h3 v8 h-3 Z" />
+</vector>
