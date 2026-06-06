@@ -5,9 +5,9 @@ package com.example.wearshooter
  * Kept dependency-free so they are trivial to tune, test, or swap for sprites.
  */
 
-enum class EnemyType { GRUNT, WEAVER, RUSHER, GUNNER, TANK }
+enum class EnemyType { GRUNT, WEAVER, RUSHER, GUNNER, TANK, SPLITTER, ORBITER }
 enum class PowerType { POWER, SHIELD, BOMB, WEAPON, LIFE }
-enum class WeaponType { VULCAN, LASER, WIDE }
+enum class WeaponType { VULCAN, LASER, WIDE, HOMING }
 
 class Player {
     var x = 0f
@@ -22,7 +22,10 @@ class Bullet(var x: Float, var y: Float, var vy: Float, var vx: Float = 0f) {
     var alive = true
     var damage = 1
     var pierce = 0       // extra enemies it can pass through before dying (laser)
-    var kind = 0         // 0 = vulcan, 1 = laser, 2 = wide  (drawing only)
+    var kind = 0         // 0 = vulcan, 1 = laser, 2 = wide, 3 = homing  (drawing only)
+    var homing = false   // steers toward the nearest enemy / boss
+    var speed = 0f       // travel speed kept constant while homing
+    var life = 0f        // seconds before a homing missile fizzles (0 = unlimited)
 }
 
 /** A descending enemy. Behaviour depends on [type]; tougher types have more hp. */
@@ -35,9 +38,10 @@ class Enemy(var x: Float, var y: Float, var radius: Float, var type: EnemyType) 
     var baseX = x        // centre any sway around the spawn column
     var swayAmp = 0f
     var wobble = 0f
-    var fireTimer = 0f   // counts down to the next shot (gunner / tank)
+    var fireTimer = 0f   // counts down to the next shot (gunner / tank / orbiter)
     var hitFlash = 0f    // seconds of white flash after being hit but not killed
     var scoreValue = 1   // multiplied by the base score on death
+    var orbitAng = 0f    // ORBITER: angle around its descending centre column
 }
 
 /** An enemy projectile — the thing the player has to dodge. */
@@ -52,7 +56,7 @@ class PowerUp(var x: Float, var y: Float, var vy: Float, var type: PowerType, va
     var wobble = 0f
 }
 
-/** A periodic mid-boss with a health bar and bullet patterns. */
+/** A periodic boss with a health bar and bullet patterns. */
 class Boss(var x: Float, var y: Float, var radius: Float, hp: Int) {
     var maxHp = hp
     var hp = hp
@@ -62,7 +66,11 @@ class Boss(var x: Float, var y: Float, var radius: Float, hp: Int) {
     var fireTimer = 0f
     var moveDir = 1
     var hitFlash = 0f
-    var variant = 0       // 0 = purple, 1 = crimson (different patterns & look)
+    var variant = 0       // 0..3 = the four rotating bosses, 4 = OVERLORD (every 5th)
+    var spin = 0f         // accumulates for rotating spoke / spiral patterns
+    var enraged = false   // HP dropped below the enrage threshold → faster, denser
+    var isFinal = false   // the OVERLORD mega-boss with HP-gated phases
+    var name = ""         // shown under the WARNING banner
 }
 
 /** A short-lived floating bit of HUD text (score gains, GRAZE, 1UP, …). */

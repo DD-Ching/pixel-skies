@@ -34,10 +34,10 @@ object GameConfig {
     // ---- Enemy bullets (the thing you dodge) ----
     const val EBULLET_RADIUS_FRACTION = 0.018f
     const val EBULLET_SPEED = 150f           // base downward/aimed speed
-    const val EBULLET_MAX = 150              // hard cap so a boss spread can't flood the watch
+    const val EBULLET_MAX = 220              // hard cap; raised for the hardcore bullet-hell curtains
 
     // ---- Enemies ----
-    const val ENEMY_MAX = 28
+    const val ENEMY_MAX = 30
     const val ENEMY_RADIUS_FRACTION = 0.050f
     const val ENEMY_SPEED_BASE = 80f
     const val GUNNER_FIRE_INTERVAL = 1.7f    // seconds; scaled down as difficulty rises
@@ -47,12 +47,19 @@ object GameConfig {
     // ---- Difficulty / pacing ----
     const val STAGE_DURATION = 20f           // seconds per stage (drives the STAGE banner)
     const val SPAWN_INTERVAL_START = 1.05f
-    const val SPAWN_INTERVAL_MIN = 0.32f
-    const val BOSS_INTERVAL = 38f            // seconds of normal play between bosses
+    const val SPAWN_INTERVAL_MIN = 0.28f
+    const val BOSS_INTERVAL = 38f            // seconds between bosses; shrinks as you beat more
+    const val BOSS_INTERVAL_MIN = 22f        // bosses come this often at the late game
+    const val DIFFICULTY_CAP = 9f            // ceiling so stats can't run away (was 8)
 
     // ---- Boss ----
     const val BOSS_RADIUS_FRACTION = 0.17f
     const val BOSS_BASE_HP = 60              // grows each time a boss is beaten
+    const val ENRAGE_HP_FRACTION = 0.35f     // below this fraction the boss fires faster & denser
+    const val FINAL_BOSS_EVERY = 5           // every Nth boss is the multi-phase OVERLORD
+    const val FINAL_BOSS_HP_MULT = 2.2f      // OVERLORD is this much tougher than a normal boss
+    const val BOSS_INTENSITY_PER_KILL = 0.12f // bullet-density ramp per boss beaten (endless)
+    const val BOSS_INTENSITY_MAX = 2.2f
 
     // ---- Power-ups ----
     const val POWERUP_DROP_CHANCE = 0.12f    // chance a normal kill drops something

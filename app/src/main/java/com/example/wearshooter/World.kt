@@ -5,8 +5,15 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Typeface
 import com.example.wearshooter.GameConfig.BOSS_BASE_HP
+import com.example.wearshooter.GameConfig.BOSS_INTENSITY_MAX
+import com.example.wearshooter.GameConfig.BOSS_INTENSITY_PER_KILL
 import com.example.wearshooter.GameConfig.BOSS_INTERVAL
+import com.example.wearshooter.GameConfig.BOSS_INTERVAL_MIN
 import com.example.wearshooter.GameConfig.BOSS_RADIUS_FRACTION
+import com.example.wearshooter.GameConfig.DIFFICULTY_CAP
+import com.example.wearshooter.GameConfig.ENRAGE_HP_FRACTION
+import com.example.wearshooter.GameConfig.FINAL_BOSS_EVERY
+import com.example.wearshooter.GameConfig.FINAL_BOSS_HP_MULT
 import com.example.wearshooter.GameConfig.BULLET_H_FRACTION
 import com.example.wearshooter.GameConfig.BULLET_SPEED
 import com.example.wearshooter.GameConfig.BULLET_W_FRACTION
@@ -97,6 +104,9 @@ class World {
     private val popups = ArrayList<Popup>(24)
     private val stars = ArrayList<Star>(STAR_COUNT)
     private var boss: Boss? = null
+    // Enemies spawned mid-frame (e.g. splitter children) are buffered here and flushed
+    // after the update loops so we never mutate `enemies` while iterating it.
+    private val spawnQueue = ArrayList<Enemy>(8)
 
     // ---- Run state ----
     private var state = State.READY
@@ -133,6 +143,8 @@ class World {
     private var shakeTime = 0f
     private var shakeMag = 0f
     private var bombFlash = 0f
+    private var eventBanner = ""        // big centred call-out (boss name reveal, OVERLORD DOWN…)
+    private var eventBannerTime = 0f
 
     // ---- Input ----
     private val inputLock = Any()
@@ -207,6 +219,7 @@ class World {
         animTime += dt
         if (shakeTime > 0f) shakeTime -= dt
         if (bombFlash > 0f) bombFlash -= dt
+        if (eventBannerTime > 0f) eventBannerTime -= dt
 
         val rotary = consumeRotary()
         if (tapPending) { tapPending = false; handleTap() }
@@ -238,7 +251,8 @@ class World {
 
     private fun startGame() {
         bullets.clear(); enemies.clear(); enemyBullets.clear()
-        powerUps.clear(); particles.clear(); popups.clear(); boss = null
+        powerUps.clear(); particles.clear(); popups.clear(); spawnQueue.clear(); boss = null
+        eventBanner = ""; eventBannerTime = 0f
         score = 0; elapsed = 0f
         lives = START_LIVES; bombs = START_BOMBS; powerLevel = 1; shield = 0; invuln = 0f
         weapon = WeaponType.VULCAN; nextExtraLife = EXTRA_LIFE_EVERY
@@ -272,10 +286,12 @@ class World {
         while (fireTimer >= FIRE_INTERVAL) { fireTimer -= FIRE_INTERVAL; fireWeapon() }
 
         // --- Boss scheduling: between bosses, spawn the swarm ---
+        // Bosses arrive more often the deeper you get, so late play is wall-to-wall fights.
+        val bossInterval = (BOSS_INTERVAL - bossesBeaten * 2f).coerceAtLeast(BOSS_INTERVAL_MIN)
         val b = boss
         if (b == null) {
             bossTimer += dt
-            if (bossTimer >= BOSS_INTERVAL) {
+            if (bossTimer >= bossInterval) {
                 spawnBoss()
             } else {
                 spawnInterval = (SPAWN_INTERVAL_START / (1f + (diff - 1f) * 0.65f))
@@ -299,6 +315,12 @@ class World {
         updatePopups(dt)
         checkCollisions()
 
+        // Flush anything spawned mid-frame (splitter children) now that the loops are done.
+        if (spawnQueue.isNotEmpty()) {
+            for (e in spawnQueue) if (enemies.size < ENEMY_MAX) enemies.add(e)
+            spawnQueue.clear()
+        }
+
         // Combo decay — let a chain lapse if you stop killing.
         if (comboTimer > 0f) {
             comboTimer -= dt
@@ -320,7 +342,15 @@ class World {
      */
     private fun difficulty(): Float =
         (1f + elapsed / 30f + bossesBeaten * 0.5f + (powerLevel - 1) * 0.16f + score / 30000f)
-            .coerceAtMost(8f)
+            .coerceAtMost(DIFFICULTY_CAP)
+
+    /**
+     * Bullet-density multiplier for boss/enemy patterns. Unlike [difficulty] (which is capped so
+     * enemy stats can't explode), this keeps climbing with every boss beaten — so the *amount* of
+     * lead in the air ramps endlessly into a proper bullet-hell, while speeds/HP stay sane.
+     */
+    private fun intensity(): Float =
+        (1f + bossesBeaten * BOSS_INTENSITY_PER_KILL).coerceAtMost(BOSS_INTENSITY_MAX)
 
     /** Enemy HP scales up continuously with difficulty so they never become trivial. */
     private fun scaledHp(base: Int, diff: Float): Int =
@@ -336,6 +366,7 @@ class World {
             WeaponType.VULCAN -> fireVulcan(muzzleY, off)
             WeaponType.LASER -> fireLaser(muzzleY, off)
             WeaponType.WIDE -> fireWide(muzzleY, off)
+            WeaponType.HOMING -> fireHoming(muzzleY, off)
         }
     }
 
@@ -383,14 +414,56 @@ class World {
         }
     }
 
+    /**
+     * Seeking missiles — fewer shots, slower, but they curve onto whatever's nearest, so the
+     * swarm and the boss get hunted down even while you focus on dodging. A real late-game treat.
+     */
+    private fun fireHoming(muzzleY: Float, off: Float) {
+        val count = min(1 + powerLevel / 2, 4)            // 1..4 missiles
+        val dmg = 2 + (powerLevel - 1) / 2                // 2..5
+        val speed = BULLET_SPEED * 0.82f
+        for (i in 0 until count) {
+            val x = player.x + (i - (count - 1) / 2f) * off * 1.4f
+            bullets.add(Bullet(x, muzzleY, -speed).also {
+                it.damage = dmg; it.kind = 3; it.homing = true; it.speed = speed; it.life = 2.6f
+            })
+        }
+    }
+
     private fun updateBullets(dt: Float) {
         for (bl in bullets) {
+            if (bl.homing) steerHoming(bl, dt)
             bl.x += bl.vx * dt
             bl.y += bl.vy * dt
-            if (bl.y < -minDim * 0.05f || bl.x < -minDim * 0.1f || bl.x > w + minDim * 0.1f) {
-                bl.alive = false
+            if (bl.life > 0f) { bl.life -= dt; if (bl.life <= 0f) bl.alive = false }
+            val offTop = bl.y < -minDim * 0.05f
+            val offSide = bl.x < -minDim * 0.1f || bl.x > w + minDim * 0.1f
+            val offBottom = bl.homing && bl.y > h + minDim * 0.1f   // seekers can dive; cull below too
+            if (offTop || offSide || offBottom) bl.alive = false
+        }
+    }
+
+    /** Curve a homing missile toward the nearest enemy/boss centre, keeping its speed constant. */
+    private fun steerHoming(bl: Bullet, dt: Float) {
+        var tx = 0f; var ty = 0f; var best = Float.MAX_VALUE; var found = false
+        for (e in enemies) {
+            if (!e.alive) continue
+            val d = (e.x - bl.x) * (e.x - bl.x) + (e.y - bl.y) * (e.y - bl.y)
+            if (d < best) { best = d; tx = e.x; ty = e.y; found = true }
+        }
+        boss?.let { b ->
+            if (b.alive && !b.entering) {
+                val d = (b.x - bl.x) * (b.x - bl.x) + (b.y - bl.y) * (b.y - bl.y)
+                if (d < best) { best = d; tx = b.x; ty = b.y; found = true }
             }
         }
+        if (!found) return
+        val ang = atan2(ty - bl.y, tx - bl.x)
+        val desiredVx = cos(ang) * bl.speed
+        val desiredVy = sin(ang) * bl.speed
+        val k = (dt * 7f).coerceAtMost(1f)               // turn rate
+        bl.vx += (desiredVx - bl.vx) * k
+        bl.vy += (desiredVy - bl.vy) * k
     }
 
     // =====================================================================
@@ -398,7 +471,11 @@ class World {
     // =====================================================================
     private fun spawnEnemy(diff: Float) {
         val type = pickEnemyType(diff)
-        val r = minDim * ENEMY_RADIUS_FRACTION * if (type == EnemyType.TANK) 1.5f else 1f
+        val r = minDim * ENEMY_RADIUS_FRACTION * when (type) {
+            EnemyType.TANK -> 1.5f
+            EnemyType.SPLITTER -> 1.25f
+            else -> 1f
+        }
         val half = (safeHalfWidthAt(player.y) - margin - r).coerceAtLeast(minDim * 0.10f)
         val x = cx + (Random.nextFloat() * 2f - 1f) * half
         val e = Enemy(x, -r, r, type)
@@ -430,6 +507,19 @@ class World {
                 e.vy = ENEMY_SPEED_BASE * 0.5f * speedScale
                 e.fireTimer = 1.0f + Random.nextFloat() * TANK_FIRE_INTERVAL
             }
+            EnemyType.SPLITTER -> {
+                // Drifts in steadily; bursts into a spray of fast grunts when killed.
+                e.scoreValue = 5; setHp(e, 4, diff)
+                e.vy = ENEMY_SPEED_BASE * 0.65f * speedScale
+            }
+            EnemyType.ORBITER -> {
+                // Spirals down its column while peppering aimed shots — hard to pin down.
+                e.scoreValue = 4; setHp(e, 2, diff)
+                e.vy = ENEMY_SPEED_BASE * 0.55f * speedScale
+                e.swayAmp = minDim * (0.10f + Random.nextFloat() * 0.05f)   // orbit radius
+                e.orbitAng = Random.nextFloat() * 6.283f
+                e.fireTimer = 0.5f + Random.nextFloat() * 1.2f
+            }
         }
         enemies.add(e)
     }
@@ -456,12 +546,15 @@ class World {
         }
     }
 
-    /** Type weights shift toward tougher enemies as difficulty climbs. */
+    /** Type weights shift toward tougher / trickier enemies as difficulty climbs. */
     private fun pickEnemyType(diff: Float): EnemyType {
         val gunner = ((diff - 1f) * 0.9f).coerceIn(0f, 3f)
         val tank = ((diff - 1.8f) * 0.5f).coerceIn(0f, 2f)
         val rusher = ((diff - 0.5f) * 0.5f).coerceIn(0f, 2f)
-        val weights = floatArrayOf(3f, 1.4f, rusher, gunner, tank) // GRUNT,WEAVER,RUSHER,GUNNER,TANK
+        val splitter = ((diff - 2.5f) * 0.55f).coerceIn(0f, 1.8f)   // mid-game onward
+        val orbiter = ((diff - 3.5f) * 0.5f).coerceIn(0f, 1.6f)     // late-game onward
+        // Order MUST match EnemyType: GRUNT,WEAVER,RUSHER,GUNNER,TANK,SPLITTER,ORBITER
+        val weights = floatArrayOf(3f, 1.4f, rusher, gunner, tank, splitter, orbiter)
         val total = weights.sum()
         var pick = Random.nextFloat() * total
         for (i in weights.indices) {
@@ -475,21 +568,35 @@ class World {
         for (e in enemies) {
             if (e.hitFlash > 0f) e.hitFlash -= dt
             e.y += e.vy * dt
-            if (e.swayAmp > 0f) {
-                e.wobble += dt * 2.6f
-                e.x = e.baseX + sin(e.wobble) * e.swayAmp
+            when {
+                e.type == EnemyType.ORBITER -> {                    // fast circular descent
+                    e.orbitAng += dt * 3.4f
+                    e.x = e.baseX + cos(e.orbitAng) * e.swayAmp
+                }
+                e.swayAmp > 0f -> {                                 // weaver / swaying formation
+                    e.wobble += dt * 2.6f
+                    e.x = e.baseX + sin(e.wobble) * e.swayAmp
+                }
             }
             // Shooting enemies fire once on screen.
-            if ((e.type == EnemyType.GUNNER || e.type == EnemyType.TANK) && e.y > 0f && e.y < cy) {
+            val shooter = e.type == EnemyType.GUNNER || e.type == EnemyType.TANK || e.type == EnemyType.ORBITER
+            if (shooter && e.y > 0f && e.y < cy * 1.2f) {
                 e.fireTimer -= dt
                 if (e.fireTimer <= 0f) {
-                    val base = if (e.type == EnemyType.GUNNER) GUNNER_FIRE_INTERVAL else TANK_FIRE_INTERVAL
-                    e.fireTimer = (base / (1f + (diff - 1f) * 0.25f)).coerceAtLeast(0.5f)
-                    if (e.type == EnemyType.GUNNER) {
-                        if (diff >= 3f) fanShot(e.x, e.y, e.radius, 3, diff)  // 3-fan once it's tough
-                        else aimedShot(e.x, e.y, e.radius, diff)
-                    } else {
-                        fanShot(e.x, e.y, e.radius, if (diff >= 4f) 5 else 3, diff)
+                    when (e.type) {
+                        EnemyType.GUNNER -> {
+                            e.fireTimer = (GUNNER_FIRE_INTERVAL / (1f + (diff - 1f) * 0.25f)).coerceAtLeast(0.45f)
+                            if (diff >= 3f) fanShot(e.x, e.y, e.radius, 3, diff)  // 3-fan once it's tough
+                            else aimedShot(e.x, e.y, e.radius, diff)
+                        }
+                        EnemyType.TANK -> {
+                            e.fireTimer = (TANK_FIRE_INTERVAL / (1f + (diff - 1f) * 0.25f)).coerceAtLeast(0.5f)
+                            fanShot(e.x, e.y, e.radius, if (diff >= 4f) 5 else 3, diff)
+                        }
+                        else -> {                                    // ORBITER: quick aimed taps
+                            e.fireTimer = (1.0f / (1f + (diff - 1f) * 0.2f)).coerceAtLeast(0.4f)
+                            aimedShot(e.x, e.y, e.radius, diff)
+                        }
                     }
                 }
             }
@@ -530,23 +637,54 @@ class World {
     //  Boss
     // =====================================================================
     private fun spawnBoss() {
-        val r = minDim * BOSS_RADIUS_FRACTION
-        val hp = BOSS_BASE_HP + bossesBeaten * 35
-        boss = Boss(cx, -r, r, hp).also { it.variant = bossesBeaten % 2 }
+        val variant = bossesBeaten % FINAL_BOSS_EVERY          // 0..4
+        val isFinal = variant == FINAL_BOSS_EVERY - 1          // every 5th boss = OVERLORD
+        val baseHp = BOSS_BASE_HP + bossesBeaten * 35
+        val hp = if (isFinal) (baseHp * FINAL_BOSS_HP_MULT).toInt() else baseHp
+        val r = minDim * BOSS_RADIUS_FRACTION * if (isFinal) 1.28f else 1f
+        boss = Boss(cx, -r, r, hp).also {
+            it.variant = variant
+            it.isFinal = isFinal
+            it.name = bossName(variant)
+        }
         enemyBullets.clear()
         stageBanner = 1.4f
+        showBanner(if (isFinal) "!! OVERLORD !!" else bossName(variant), 1.8f)
+        if (isFinal) { shake(0.4f, minDim * 0.03f); vibrate?.invoke(60) }
     }
+
+    private fun bossName(variant: Int): String = when (variant) {
+        0 -> "WARDEN"
+        1 -> "REAVER"
+        2 -> "SEER"
+        3 -> "STORMCALLER"
+        else -> "OVERLORD"
+    }
+
+    private fun showBanner(text: String, time: Float) { eventBanner = text; eventBannerTime = time }
 
     private fun updateBoss(b: Boss, dt: Float, diff: Float) {
         if (b.hitFlash > 0f) b.hitFlash -= dt
         b.phase += dt
+        b.spin += dt
         if (b.entering) {
             b.y += 90f * dt
-            if (b.y >= cy * 0.55f) { b.y = cy * 0.55f; b.entering = false }
+            val restY = if (b.isFinal) cy * 0.5f else cy * 0.55f
+            if (b.y >= restY) { b.y = restY; b.entering = false }
             return
         }
-        // Sweep horizontally within the safe band (the crimson boss moves faster).
-        val speed = if (b.variant == 0) 70f else 110f
+
+        // Cross the enrage threshold once: tighter timers, denser bursts, a faster sweep.
+        if (!b.enraged && b.hp <= b.maxHp * ENRAGE_HP_FRACTION) {
+            b.enraged = true
+            showBanner("ENRAGED", 0.9f)
+            shake(0.3f, minDim * 0.025f)
+            vibrate?.invoke(40)
+        }
+
+        // Sweep horizontally within the safe band; speed depends on variant + enrage.
+        val baseSpeed = when (b.variant) { 0 -> 70f; 1 -> 110f; 2 -> 95f; 3 -> 120f; else -> 105f }
+        val speed = baseSpeed * if (b.enraged) 1.35f else 1f
         val half = safeHalfWidthAt(b.y) - margin - b.radius
         b.x += b.moveDir * speed * dt
         if (b.x > cx + half) { b.x = cx + half; b.moveDir = -1 }
@@ -554,22 +692,64 @@ class World {
 
         b.fireTimer -= dt
         if (b.fireTimer <= 0f) {
-            if (b.variant == 0) {
-                // Purple boss: fan -> ring -> gap-wall -> spiral.
-                when ((b.phase / 3.2f).toInt() % 4) {
-                    0 -> { b.fireTimer = 0.9f; fanShot(b.x, b.y, b.radius, 5, diff) }
-                    1 -> { b.fireTimer = 1.3f; radialBurst(b.x, b.y, b.radius, 12, diff) }
-                    2 -> { b.fireTimer = 1.25f; gapWall(b.y, diff) }
-                    else -> { b.fireTimer = 0.12f; spiral(b, diff) }
-                }
-            } else {
-                // Crimson boss: tight aimed bursts, gap-wall, wide ring, sweeping stream.
-                when ((b.phase / 3.0f).toInt() % 4) {
-                    0 -> { b.fireTimer = 0.55f; fanShot(b.x, b.y, b.radius, 3, diff) }
-                    1 -> { b.fireTimer = 1.1f; gapWall(b.y, diff) }
-                    2 -> { b.fireTimer = 1.4f; radialBurst(b.x, b.y, b.radius, 16, diff) }
-                    else -> { b.fireTimer = 0.1f; streamDown(b, diff) }
-                }
+            if (b.isFinal) fireFinalPattern(b, diff) else fireBossPattern(b, diff)
+        }
+    }
+
+    /** The four rotating bosses, each with its own four-beat pattern loop. */
+    private fun fireBossPattern(b: Boss, diff: Float) {
+        val inten = intensity()
+        val ef = if (b.enraged) 0.62f else 1f
+        when (b.variant) {
+            0 -> when ((b.phase / 3.2f).toInt() % 4) {                      // WARDEN — purple
+                0 -> { b.fireTimer = 0.85f * ef; fanShot(b.x, b.y, b.radius, (5 * inten).toInt(), diff) }
+                1 -> { b.fireTimer = 1.2f * ef; radialBurst(b.x, b.y, b.radius, (12 * inten).toInt(), diff) }
+                2 -> { b.fireTimer = 1.15f * ef; gapWall(b.y, diff) }
+                else -> { b.fireTimer = 0.12f * ef; spiral(b, diff) }
+            }
+            1 -> when ((b.phase / 3.0f).toInt() % 4) {                      // REAVER — crimson
+                0 -> { b.fireTimer = 0.5f * ef; aimedSpread(b.x, b.y, b.radius, 3 + (inten - 1f).toInt(), 0.18f, diff) }
+                1 -> { b.fireTimer = 1.0f * ef; gapWall(b.y, diff) }
+                2 -> { b.fireTimer = 1.3f * ef; radialBurst(b.x, b.y, b.radius, (16 * inten).toInt(), diff) }
+                else -> { b.fireTimer = 0.1f * ef; streamDown(b, diff) }
+            }
+            2 -> when ((b.phase / 3.0f).toInt() % 4) {                      // SEER — green, weaving curtains
+                0 -> { b.fireTimer = 0.7f * ef; aimedSpread(b.x, b.y, b.radius, (5 * inten).toInt(), 0.16f, diff) }
+                1 -> { b.fireTimer = 0.9f * ef; waveColumn(b, diff) }
+                2 -> { b.fireTimer = 1.2f * ef; petalBurst(b, (10 * inten).toInt(), diff) }
+                else -> { b.fireTimer = 0.1f * ef; spokeSpin(b, 4, diff) }
+            }
+            else -> when ((b.phase / 3.0f).toInt() % 4) {                   // STORMCALLER — blue, spinning stars
+                0 -> { b.fireTimer = 0.6f * ef; crossShot(b.x, b.y, diff, b.spin) }
+                1 -> { b.fireTimer = 1.1f * ef; gapWall(b.y, diff) }
+                2 -> { b.fireTimer = 0.1f * ef; spokeSpin(b, 6, diff) }
+                else -> { b.fireTimer = 1.2f * ef; radialBurst(b.x, b.y, b.radius, (20 * inten).toInt(), diff) }
+            }
+        }
+    }
+
+    /** OVERLORD — the every-5th mega-boss. Three HP-gated phases that pile patterns on top. */
+    private fun fireFinalPattern(b: Boss, diff: Float) {
+        val inten = intensity()
+        val frac = b.hp.toFloat() / b.maxHp
+        val ef = if (b.enraged) 0.6f else 1f
+        when {
+            frac > 0.66f -> when ((b.phase / 2.6f).toInt() % 3) {           // Phase 1 — warm-up
+                0 -> { b.fireTimer = 0.8f * ef; fanShot(b.x, b.y, b.radius, (7 * inten).toInt(), diff) }
+                1 -> { b.fireTimer = 1.1f * ef; radialBurst(b.x, b.y, b.radius, (16 * inten).toInt(), diff) }
+                else -> { b.fireTimer = 0.7f * ef; aimedSpread(b.x, b.y, b.radius, (5 * inten).toInt(), 0.16f, diff) }
+            }
+            frac > 0.33f -> when ((b.phase / 2.6f).toInt() % 4) {           // Phase 2 — spins & walls
+                0 -> { b.fireTimer = 0.1f * ef; spokeSpin(b, 6, diff) }
+                1 -> { b.fireTimer = 1.0f * ef; gapWall(b.y, diff) }
+                2 -> { b.fireTimer = 0.6f * ef; crossShot(b.x, b.y, diff, b.spin) }
+                else -> { b.fireTimer = 1.1f * ef; petalBurst(b, (12 * inten).toInt(), diff) }
+            }
+            else -> when ((b.phase / 2.2f).toInt() % 4) {                   // Phase 3 — everything, fast
+                0 -> { b.fireTimer = 0.1f; spokeSpin(b, 8, diff) }
+                1 -> { b.fireTimer = 0.85f; gapWall(b.y, diff); radialBurst(b.x, b.y, b.radius, (14 * inten).toInt(), diff) }
+                2 -> { b.fireTimer = 0.1f; spiral(b, diff) }
+                else -> { b.fireTimer = 0.9f; petalBurst(b, (16 * inten).toInt(), diff); aimedSpread(b.x, b.y, b.radius, 5, 0.14f, diff) }
             }
         }
     }
@@ -624,24 +804,106 @@ class World {
         }
     }
 
+    /** A tight shotgun cone aimed straight at the player — the spread is the pressure. */
+    private fun aimedSpread(x: Float, y: Float, r: Float, count: Int, spread: Float, diff: Float) {
+        if (count <= 0) return
+        val sp = EBULLET_SPEED * (1f + (diff - 1f) * 0.12f)
+        val br = minDim * EBULLET_RADIUS_FRACTION
+        val center = atan2(player.y - y, player.x - x)
+        for (i in 0 until count) {
+            if (enemyBullets.size >= EBULLET_MAX) break
+            val a = center + (i - (count - 1) / 2f) * spread
+            enemyBullets.add(EnemyBullet(x, y + r, cos(a) * sp, sin(a) * sp, br))
+        }
+    }
+
+    /** A radial spray whose per-spoke speed pulses, so the bullets bloom into flower petals. */
+    private fun petalBurst(b: Boss, count: Int, diff: Float) {
+        if (count <= 0) return
+        val baseSp = EBULLET_SPEED * 0.85f * (1f + (diff - 1f) * 0.1f)
+        val br = minDim * EBULLET_RADIUS_FRACTION
+        val rot = b.spin * 0.8f
+        for (i in 0 until count) {
+            if (enemyBullets.size >= EBULLET_MAX) break
+            val a = rot + i.toFloat() / count * 6.283f
+            val sp = baseSp * (0.55f + 0.45f * abs(sin(a * 5f)))   // five speed lobes → five petals
+            enemyBullets.add(EnemyBullet(b.x, b.y, cos(a) * sp, sin(a) * sp + 20f, br))
+        }
+    }
+
+    /** Four fast beams in a plus that slowly rotates into an X and back — sweeping lasers of lead. */
+    private fun crossShot(x: Float, y: Float, diff: Float, rotate: Float) {
+        val sp = EBULLET_SPEED * 1.2f * (1f + (diff - 1f) * 0.1f)
+        val br = minDim * EBULLET_RADIUS_FRACTION
+        val arms = 4
+        for (i in 0 until arms) {
+            if (enemyBullets.size >= EBULLET_MAX) break
+            val a = rotate * 0.6f + i.toFloat() / arms * 6.283f
+            enemyBullets.add(EnemyBullet(x, y, cos(a) * sp, sin(a) * sp, br))
+        }
+    }
+
+    /** A rapid-fire rotating pinwheel: fired on a tiny cadence so the arms trace spiral curves. */
+    private fun spokeSpin(b: Boss, arms: Int, diff: Float) {
+        val sp = EBULLET_SPEED * 0.9f * (1f + (diff - 1f) * 0.1f)
+        val br = minDim * EBULLET_RADIUS_FRACTION
+        val base = b.spin * 3.2f
+        for (k in 0 until arms) {
+            if (enemyBullets.size >= EBULLET_MAX) break
+            val a = base + k.toFloat() / arms * 6.283f
+            enemyBullets.add(EnemyBullet(b.x, b.y, cos(a) * sp, sin(a) * sp, br))
+        }
+    }
+
+    /** A full-width falling curtain where each column is offset sideways into a snaking wave. */
+    private fun waveColumn(b: Boss, diff: Float) {
+        val br = minDim * EBULLET_RADIUS_FRACTION
+        val sp = EBULLET_SPEED * 0.8f * (1f + (diff - 1f) * 0.1f)
+        val n = 9
+        val spanHalf = (safeHalfWidthAt(b.y) - margin).coerceAtLeast(minDim * 0.2f)
+        for (i in 0 until n) {
+            if (enemyBullets.size >= EBULLET_MAX) break
+            val t = i.toFloat() / (n - 1)
+            val x = cx - spanHalf + 2f * spanHalf * t
+            val vx = sin(b.phase * 3f + t * 6.283f) * sp * 0.5f
+            enemyBullets.add(EnemyBullet(x, b.y, vx, sp, br))
+        }
+    }
+
     private fun bossDefeated(b: Boss) {
         b.alive = false
-        val bonus = 2000 * (1 + bossesBeaten)
+        val mult = if (b.isFinal) 4 else 1
+        val bonus = 2000 * (1 + bossesBeaten) * mult
         addScore(bonus)
-        spawnPopup(b.x, b.y, "BOSS DOWN +$bonus", 0xFFFFF36B.toInt())
+        spawnPopup(b.x, b.y, "${b.name} DOWN +$bonus", 0xFFFFF36B.toInt())
         bossesBeaten++
         bossTimer = 0f
         stage++; stageBanner = 1.6f
-        shake(0.6f, minDim * 0.05f)
-        bombFlash = 0.25f
-        vibrate?.invoke(120)
-        // Big burst + guaranteed rewards (incl. a weapon to try).
-        repeat(6) { explode(b.x + (Random.nextFloat() - 0.5f) * b.radius,
-            b.y + (Random.nextFloat() - 0.5f) * b.radius, b.radius * 0.6f) }
-        dropPowerUp(b.x - b.radius * 0.5f, b.y, PowerType.POWER)
-        dropPowerUp(b.x, b.y, PowerType.WEAPON)
-        dropPowerUp(b.x + b.radius * 0.5f, b.y, PowerType.BOMB)
         enemyBullets.clear()
+
+        if (b.isFinal) {
+            // A proper clear: screen-filling burst, long rumble, a victory banner, fat rewards.
+            showBanner("WAVE CLEAR!", 2.4f)
+            shake(0.9f, minDim * 0.07f)
+            bombFlash = 0.4f
+            vibrate?.invoke(220)
+            repeat(16) { explode(b.x + (Random.nextFloat() - 0.5f) * b.radius * 2f,
+                b.y + (Random.nextFloat() - 0.5f) * b.radius * 2f, b.radius * 0.7f) }
+            dropPowerUp(b.x - b.radius * 0.7f, b.y, PowerType.POWER)
+            dropPowerUp(b.x - b.radius * 0.25f, b.y, PowerType.WEAPON)
+            dropPowerUp(b.x + b.radius * 0.25f, b.y, PowerType.BOMB)
+            dropPowerUp(b.x + b.radius * 0.7f, b.y, PowerType.SHIELD)
+            dropPowerUp(b.x, b.y - b.radius * 0.5f, PowerType.LIFE)
+        } else {
+            shake(0.6f, minDim * 0.05f)
+            bombFlash = 0.25f
+            vibrate?.invoke(120)
+            repeat(6) { explode(b.x + (Random.nextFloat() - 0.5f) * b.radius,
+                b.y + (Random.nextFloat() - 0.5f) * b.radius, b.radius * 0.6f) }
+            dropPowerUp(b.x - b.radius * 0.5f, b.y, PowerType.POWER)
+            dropPowerUp(b.x, b.y, PowerType.WEAPON)
+            dropPowerUp(b.x + b.radius * 0.5f, b.y, PowerType.BOMB)
+        }
     }
 
     // =====================================================================
@@ -691,7 +953,8 @@ class World {
         weapon = when (weapon) {
             WeaponType.VULCAN -> WeaponType.LASER
             WeaponType.LASER -> WeaponType.WIDE
-            WeaponType.WIDE -> WeaponType.VULCAN
+            WeaponType.WIDE -> WeaponType.HOMING
+            WeaponType.HOMING -> WeaponType.VULCAN
         }
         spawnPopup(x, y, weaponName(weapon), 0xFFFF7AE0.toInt())
     }
@@ -706,12 +969,14 @@ class World {
         WeaponType.VULCAN -> "VULCAN"
         WeaponType.LASER -> "LASER"
         WeaponType.WIDE -> "WIDE"
+        WeaponType.HOMING -> "HOMING"
     }
 
     private fun weaponColor(wt: WeaponType): Int = when (wt) {
         WeaponType.VULCAN -> 0xFF8CF6FF.toInt()
         WeaponType.LASER -> 0xFFFF6BE3.toInt()
         WeaponType.WIDE -> 0xFFFFB23D.toInt()
+        WeaponType.HOMING -> 0xFF8AFF6B.toInt()
     }
 
     // =====================================================================
@@ -832,7 +1097,27 @@ class World {
         addScore(gain)
         if (e.scoreValue >= 4) spawnPopup(e.x, e.y, "+$gain", 0xFFFFFFFF.toInt())  // gunners/tanks
         explode(e.x, e.y, e.radius)
+        if (e.type == EnemyType.SPLITTER) spawnSplitterChildren(e)
         maybeDrop(e.x, e.y)
+    }
+
+    /** A killed splitter bursts into a fan of fast little rushers (queued, never re-splits). */
+    private fun spawnSplitterChildren(parent: Enemy) {
+        val diff = difficulty()
+        val n = if (diff >= 5f) 4 else 3
+        val cr = parent.radius * 0.6f
+        val spread = parent.radius * 1.1f
+        for (i in 0 until n) {
+            if (enemies.size + spawnQueue.size >= ENEMY_MAX) break
+            val t = if (n == 1) 0f else (i.toFloat() / (n - 1)) * 2f - 1f   // -1..1
+            val x = parent.x + t * spread
+            val child = Enemy(x, parent.y, cr, EnemyType.RUSHER).apply {
+                baseX = x; scoreValue = 1; maxHp = 1; hp = 1
+                vy = ENEMY_SPEED_BASE * (1.7f + 0.1f * abs(t)) * (1f + (diff - 1f) * 0.16f)
+                swayAmp = parent.radius * 0.4f; wobble = t * 1.5f
+            }
+            spawnQueue.add(child)
+        }
     }
 
     private fun bumpCombo() {
@@ -1003,11 +1288,25 @@ class World {
         drawPopups(canvas)
 
         when (state) {
-            State.PLAYING -> drawHud(canvas)
+            State.PLAYING -> { drawHud(canvas); drawEventBanner(canvas) }
             State.PAUSED -> { drawHud(canvas); drawPausedOverlay(canvas) }
             State.READY -> drawTitle(canvas)
             State.GAME_OVER -> drawGameOver(canvas)
         }
+    }
+
+    /** Big transient call-out: boss name reveal, ENRAGED, WAVE CLEAR — drawn below centre. */
+    private fun drawEventBanner(canvas: Canvas) {
+        if (eventBannerTime <= 0f) return
+        val a = (eventBannerTime / 0.6f).coerceIn(0f, 1f)          // fade over the last 0.6s
+        val (rr, gg, bb) = when {
+            eventBanner == "ENRAGED" -> Triple(255, 60, 48)
+            eventBanner == "WAVE CLEAR!" || eventBanner.contains("OVERLORD") -> Triple(255, 194, 75)
+            else -> Triple(111, 227, 255)
+        }
+        textPaint.color = Color.argb((a * 255).toInt(), rr, gg, bb)
+        textPaint.textSize = minDim * 0.085f
+        canvas.drawText(eventBanner, cx, cy + minDim * 0.13f, textPaint)
     }
 
     private fun drawStars(canvas: Canvas) {
@@ -1064,6 +1363,18 @@ class World {
                     shapePaint.color = 0xFFFFF0C0.toInt()
                     canvas.drawRect(bl.x - s * 0.4f, bl.y - s * 0.4f, bl.x + s * 0.4f, bl.y + s * 0.4f, shapePaint)
                 }
+                3 -> { // HOMING: green diamond with a fading tail along its heading
+                    val s = bw * 1.25f
+                    val len = hypot(bl.vx, bl.vy).coerceAtLeast(1f)
+                    val tx = bl.x - bl.vx / len * s * 2.4f
+                    val ty = bl.y - bl.vy / len * s * 2.4f
+                    shapePaint.color = 0x668AFF6B.toInt()
+                    canvas.drawRect(tx - s * 0.4f, ty - s * 0.4f, tx + s * 0.4f, ty + s * 0.4f, shapePaint)
+                    shapePaint.color = 0xFF8AFF6B.toInt()
+                    canvas.drawRect(bl.x - s, bl.y - s, bl.x + s, bl.y + s, shapePaint)
+                    shapePaint.color = 0xFFFFFFFF.toInt()
+                    canvas.drawRect(bl.x - s * 0.4f, bl.y - s * 0.4f, bl.x + s * 0.4f, bl.y + s * 0.4f, shapePaint)
+                }
                 else -> { // VULCAN: cyan bolt
                     shapePaint.color = 0xFF8CF6FF.toInt()
                     canvas.drawRect(bl.x - bw / 2f, bl.y - bh / 2f, bl.x + bw / 2f, bl.y + bh / 2f, shapePaint)
@@ -1098,6 +1409,20 @@ class World {
             shapePaint.color = accent
             canvas.drawRect(ex - r, ey + r * 0.5f, ex - r * 0.5f, ey + r, shapePaint)
             canvas.drawRect(ex + r * 0.5f, ey + r * 0.5f, ex + r, ey + r, shapePaint)
+            // Type tell-tales so the new enemies read at a glance.
+            if (!flash) when (e.type) {
+                EnemyType.ORBITER -> {
+                    shapePaint.style = Paint.Style.STROKE
+                    shapePaint.strokeWidth = r * 0.12f
+                    canvas.drawCircle(ex, ey, r * 1.05f, shapePaint)
+                    shapePaint.style = Paint.Style.FILL
+                }
+                EnemyType.SPLITTER -> {
+                    shapePaint.color = 0xFF120712.toInt()                      // seam: it'll break apart
+                    canvas.drawRect(ex - r * 0.06f, ey - r, ex + r * 0.06f, ey + r, shapePaint)
+                }
+                else -> {}
+            }
             // Tiny HP pips for multi-hit enemies.
             if (e.maxHp > 1 && !flash) {
                 shapePaint.color = 0xFFFFFFFF.toInt()
@@ -1115,35 +1440,63 @@ class World {
             EnemyType.RUSHER -> Pair(0xFFFF7A3D.toInt(), 0xFFFFE08A.toInt())
             EnemyType.GUNNER -> Pair(0xFF35D07F.toInt(), 0xFFCFFF8A.toInt())
             EnemyType.TANK -> Pair(0xFF6E7BFF.toInt(), 0xFF9AE0FF.toInt())
+            EnemyType.SPLITTER -> Pair(0xFFE8E84A.toInt(), 0xFFFF9E3D.toInt())   // toxic yellow
+            EnemyType.ORBITER -> Pair(0xFF35E0D0.toInt(), 0xFFB3FFF4.toInt())    // teal drone
         }
     }
 
     private fun drawBoss(canvas: Canvas, b: Boss) {
         val r = b.radius
-        val crimson = b.variant != 0
-        shapePaint.color = when {
-            b.hitFlash > 0f -> 0xFFFFFFFF.toInt()
-            crimson -> 0xFFE23B5A.toInt()
-            else -> 0xFF8A3DFF.toInt()
+        val (body, eye, foot) = bossPalette(b.variant)
+
+        // Enrage aura: a pulsing red ring once the boss drops below the threshold.
+        if (b.enraged) {
+            val pulse = 0.5f + 0.5f * sin(animTime * 14f)
+            shapePaint.style = Paint.Style.STROKE
+            shapePaint.strokeWidth = minDim * 0.012f
+            shapePaint.color = Color.argb((120 + pulse * 120).toInt().coerceIn(0, 255), 255, 60, 48)
+            canvas.drawCircle(b.x, b.y, r * (1.12f + 0.06f * pulse), shapePaint)
+            shapePaint.style = Paint.Style.FILL
         }
+
+        shapePaint.color = if (b.hitFlash > 0f) 0xFFFFFFFF.toInt() else body
         canvas.drawRect(b.x - r, b.y - r * 0.65f, b.x + r, b.y + r * 0.65f, shapePaint)
         canvas.drawRect(b.x - r * 0.65f, b.y - r, b.x + r * 0.65f, b.y + r, shapePaint)
-        shapePaint.color = if (crimson) 0xFFFFE08A.toInt() else 0xFFFF3B30.toInt()   // eyes
+
+        // The OVERLORD wears a jagged crown of horns so it reads as the big one.
+        if (b.isFinal) {
+            shapePaint.color = if (b.hitFlash > 0f) 0xFFFFFFFF.toInt() else foot
+            val hw = r * 0.15f
+            for (k in -2..2) {
+                val hx = b.x + k * r * 0.42f
+                canvas.drawRect(hx - hw, b.y - r * 1.32f, hx + hw, b.y - r * 0.82f, shapePaint)
+            }
+        }
+
+        shapePaint.color = eye
         canvas.drawRect(b.x - r * 0.45f, b.y - r * 0.15f, b.x - r * 0.10f, b.y + r * 0.25f, shapePaint)
         canvas.drawRect(b.x + r * 0.10f, b.y - r * 0.15f, b.x + r * 0.45f, b.y + r * 0.25f, shapePaint)
-        shapePaint.color = if (crimson) 0xFF7A1830.toInt() else 0xFFFFC24B.toInt()   // feet
+        shapePaint.color = foot
         canvas.drawRect(b.x - r, b.y + r * 0.55f, b.x - r * 0.5f, b.y + r, shapePaint)
         canvas.drawRect(b.x + r * 0.5f, b.y + r * 0.55f, b.x + r, b.y + r, shapePaint)
 
-        // HP bar across the top, inside the safe area.
+        // HP bar across the top, inside the safe area (gold for the OVERLORD).
         val barW = minDim * 0.6f
         val barH = minDim * 0.03f
         val top = cy - radius + minDim * 0.06f
         shapePaint.color = 0xFF3A0A12.toInt()
         canvas.drawRect(cx - barW / 2f, top, cx + barW / 2f, top + barH, shapePaint)
-        shapePaint.color = 0xFFFF3B30.toInt()
+        shapePaint.color = if (b.isFinal) 0xFFFFC24B.toInt() else 0xFFFF3B30.toInt()
         val frac = (b.hp.toFloat() / b.maxHp).coerceIn(0f, 1f)
         canvas.drawRect(cx - barW / 2f, top, cx - barW / 2f + barW * frac, top + barH, shapePaint)
+    }
+
+    private fun bossPalette(variant: Int): Triple<Int, Int, Int> = when (variant) {
+        0 -> Triple(0xFF8A3DFF.toInt(), 0xFFFF3B30.toInt(), 0xFFFFC24B.toInt())    // WARDEN  purple
+        1 -> Triple(0xFFE23B5A.toInt(), 0xFFFFE08A.toInt(), 0xFF7A1830.toInt())    // REAVER  crimson
+        2 -> Triple(0xFF2FBF71.toInt(), 0xFFFFF36B.toInt(), 0xFF146C43.toInt())    // SEER    green
+        3 -> Triple(0xFF3D7BFF.toInt(), 0xFF9AE0FF.toInt(), 0xFF1B3A8A.toInt())    // STORM   blue
+        else -> Triple(0xFFFFC24B.toInt(), 0xFFFF3B30.toInt(), 0xFF8A5A12.toInt()) // OVERLORD gold
     }
 
     private fun drawPowerUps(canvas: Canvas) {
