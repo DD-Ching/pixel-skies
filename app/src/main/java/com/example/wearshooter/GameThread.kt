@@ -7,6 +7,13 @@ import android.view.SurfaceHolder
  * The game loop. Runs on its own thread so the simulation/render rate is
  * independent of the UI thread. Targets ~60 FPS and feeds the real frame
  * delta to the world so movement stays smooth even if a frame runs long.
+ *
+ * Rendering goes through [SurfaceHolder.lockHardwareCanvas] (GPU-composited —
+ * far cheaper per frame and per watt than the software path on every Wear OS 3+
+ * device); if the device refuses, it quietly drops back to the software canvas.
+ *
+ * Pacing uses an absolute frame deadline rather than "sleep the remainder", so
+ * timing error from one frame doesn't accumulate into visible drift.
  */
 class GameThread(
     private val holder: SurfaceHolder,
@@ -16,9 +23,12 @@ class GameThread(
     @Volatile
     var running = false
 
+    private var useHardwareCanvas = true
+
     override fun run() {
-        val targetFrameNs = 1_000_000_000L / 60L
+        val frameNs = 1_000_000_000L / 60L
         var last = System.nanoTime()
+        var deadline = last
 
         while (running) {
             val frameStart = System.nanoTime()
@@ -30,10 +40,8 @@ class GameThread(
 
             var canvas: Canvas? = null
             try {
-                canvas = holder.lockCanvas()
-                if (canvas != null) {
-                    synchronized(holder) { view.render(canvas) }
-                }
+                canvas = lockCanvas()
+                if (canvas != null) view.render(canvas)
             } finally {
                 if (canvas != null) {
                     try {
@@ -44,7 +52,10 @@ class GameThread(
                 }
             }
 
-            val sleepNs = targetFrameNs - (System.nanoTime() - frameStart)
+            deadline += frameNs
+            val now = System.nanoTime()
+            var sleepNs = deadline - now
+            if (sleepNs < -frameNs) { deadline = now; sleepNs = 0 }   // fell badly behind — resync
             if (sleepNs > 0) {
                 try {
                     sleep(sleepNs / 1_000_000L, (sleepNs % 1_000_000L).toInt())
@@ -53,5 +64,17 @@ class GameThread(
                 }
             }
         }
+    }
+
+    private fun lockCanvas(): Canvas? {
+        if (useHardwareCanvas) {
+            try {
+                return holder.lockHardwareCanvas()
+            } catch (_: Throwable) {
+                // No GPU canvas on this surface (or it's mid-teardown) — fall back for good.
+                useHardwareCanvas = false
+            }
+        }
+        return holder.lockCanvas()
     }
 }

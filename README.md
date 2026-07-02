@@ -101,23 +101,43 @@ WearGame/
       │  └─ mipmap-anydpi-v26/ic_launcher*.xml     (adaptive icon, no PNGs)
       └─ java/com/example/wearshooter/
          ├─ MainActivity.kt     Activity host; keep-screen-on; forwards crown events
-         ├─ GameView.kt         SurfaceView: owns loop, handles crown/tap/long-press/keys
-         ├─ GameThread.kt       The ~60 FPS game loop (lockCanvas → update → render)
-         ├─ World.kt            ★ All game logic + rendering (state machine, enemy AI,
-         │                        enemy bullets, boss, power-ups, lives, combo, FX, drawing)
-         ├─ Entities.kt         Player / Bullet / Enemy / EnemyBullet / PowerUp / Boss /
-         │                        Particle + the EnemyType & PowerType enums
+         ├─ GameView.kt         SurfaceView: owns loop + Renderer, handles crown/tap/long-press/keys
+         ├─ GameThread.kt       ~60 FPS loop: hardware-accelerated canvas (software fallback),
+         │                        absolute-deadline frame pacing so timing error can't drift
+         ├─ World.kt            ★ Simulation core: state machine, geometry, collisions,
+         │                        scoring/combo/graze, bomb, difficulty — no drawing
+         ├─ Weapons.kt          Player fire patterns, escort drones, Overdrive, power-ups
+         ├─ Enemies.kt          Unlock schedule, per-type behaviour, enemy shot patterns
+         ├─ Bosses.kt           Six bosses, HP-gated phases, telegraphed laser set-pieces
+         ├─ Fx.kt               Particles, shockwaves, popups, shake, banners, starfield
+         ├─ Renderer.kt         ★ Every pixel drawn: backdrops, entities, round-face HUD,
+         │                        title / pause / game-over screens
+         ├─ Palette.kt          Every colour + display name, indexed by enum ordinal
+         ├─ Pools.kt            Object pools + swap-remove sweep (zero-GC entity churn)
+         ├─ Entities.kt         Player / Bullet / Enemy / … data holders with pooled reset()
          └─ GameConfig.kt       ★ Every tuning knob (speeds, lives, spawn ramp, boss, scoring)
 ```
 
-`★` = the two files you’ll touch most for tuning and art.
+`★` = the files you’ll touch most for gameplay tuning and art.
 
 ### How it fits together
 
 - **Game loop** — `GameThread` runs on its own thread. Each frame it measures the
-  real delta time, calls `World.update(dt)`, then locks the `SurfaceHolder` canvas
-  and calls `World.render(canvas)`. Delta is clamped so a stall (GC / app switch)
-  can’t teleport entities.
+  real delta time, calls `World.update(dt)`, then locks a **hardware-accelerated**
+  `SurfaceHolder` canvas (GPU-composited; falls back to software if the device
+  refuses) and calls `Renderer.render(canvas)`. Delta is clamped so a stall
+  (GC / app switch) can’t teleport entities, and frames are paced against an
+  absolute deadline so timing error never accumulates.
+- **Zero-allocation steady state** — bullets, enemy bullets, enemies and particles
+  live in object pools (`Pools.kt`); collision code only flips an `alive` flag and
+  a once-per-frame sweep swap-removes the dead back into the pool. HUD strings are
+  cached and rebuilt only when the value changes, and all palette lookups are
+  plain array indexing — a steady frame allocates nothing, so the GC never gets a
+  chance to hitch a dodge.
+- **Round-face HUD** — everything anchored to the watch bezel is placed
+  polar-style on the safe ring: lives arc on the lower-left, bombs on the
+  lower-right, the Overdrive gauge dead-bottom between them. Nothing sits outside
+  the inscribed circle, so nothing gets clipped by the round mask.
 - **Rotary crown** — `GameView.onGenericMotionEvent` filters for
   `ACTION_SCROLL` from `SOURCE_ROTARY_ENCODER` and reads `AXIS_SCROLL`. The value
   is accumulated under a lock and drained once per frame, so input rate and frame

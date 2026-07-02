@@ -26,6 +26,7 @@ class GameView @JvmOverloads constructor(
 ) : SurfaceView(context, attrs), SurfaceHolder.Callback {
 
     private val world = World()
+    private val renderer = Renderer(world)
     private var thread: GameThread? = null
 
     @Suppress("DEPRECATION")
@@ -108,7 +109,7 @@ class GameView @JvmOverloads constructor(
 
     // ---- Called by the game loop ----
     fun update(dt: Float) = world.update(dt)
-    fun render(canvas: Canvas) = world.render(canvas)
+    fun render(canvas: Canvas) = renderer.render(canvas)
 
     // ---- Input ----
     override fun onTouchEvent(event: MotionEvent): Boolean {
